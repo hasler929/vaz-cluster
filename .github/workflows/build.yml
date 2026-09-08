@@ -23,21 +23,23 @@ jobs:
         with:
           channel: 'stable'
 
-      - name: Prepare Android Project Structure
+      - name: Build APK Cleanly
         run: |
-          # Создаем чистый каркас во временной папке
-          flutter create --platforms=android --org com.vaz.rev vaz_temp
-          # Переносим сгенерированную рабочую папку android
-          cp -r vaz_temp/android .
-          rm -rf vaz_temp
-          # Подтягиваем зависимости
-          flutter pub get
-
-      - name: Build Release APK
-        run: flutter build apk --release
+          # 1. Создаем чистый официальный проект Flutter
+          flutter create --platforms=android --org com.vaz vaz_app
+          cd vaz_app
+          
+          # 2. Добавляем soundpool через CLI (гарантирует совместимость версий)
+          flutter pub add soundpool
+          
+          # 3. Подменяем main.dart кодом из репозитория
+          cp ../lib/main.dart lib/main.dart
+          
+          # 4. Собираем APK
+          flutter build apk --release
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: vaz-turbo-apk
-          path: build/app/outputs/flutter-apk/app-release.apk
+          path: vaz_app/build/app/outputs/flutter-apk/app-release.apk
