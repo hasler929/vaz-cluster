@@ -9,7 +9,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up Java 17
         uses: actions/setup-java@v3
@@ -22,16 +23,21 @@ jobs:
         with:
           channel: 'stable'
 
-      - name: Generate Android Skeleton & Get Packages
+      - name: Prepare Android Project Structure
         run: |
-          flutter create . --platforms=android --org com.revheadz.vaz
+          # Создаем чистый каркас во временной папке
+          flutter create --platforms=android --org com.vaz.rev vaz_temp
+          # Переносим сгенерированную рабочую папку android
+          cp -r vaz_temp/android .
+          rm -rf vaz_temp
+          # Подтягиваем зависимости
           flutter pub get
 
       - name: Build Release APK
         run: flutter build apk --release
 
-      - name: Upload APK
+      - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: vaz-app-apk
+          name: vaz-turbo-apk
           path: build/app/outputs/flutter-apk/app-release.apk
