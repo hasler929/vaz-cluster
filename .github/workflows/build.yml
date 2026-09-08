@@ -25,17 +25,17 @@ jobs:
 
       - name: Build APK Cleanly
         run: |
-          # 1. Создаем чистый официальный проект Flutter
-          flutter create --platforms=android --org com.vaz vaz_app
+          # Создаем чистый проект
+          flutter create --platforms=android --org com.vaz.app vaz_app
           cd vaz_app
           
-          # 2. Добавляем soundpool через CLI (гарантирует совместимость версий)
-          flutter pub add soundpool
+          # Добавляем надежный звуковой плагин
+          flutter pub add audioplayers
           
-          # 3. Подменяем main.dart кодом из репозитория
+          # Подменяем код на наш
           cp ../lib/main.dart lib/main.dart
           
-          # 4. Собираем APK
+          # Собираем APK
           flutter build apk --release
 
       - name: Upload APK Artifact
