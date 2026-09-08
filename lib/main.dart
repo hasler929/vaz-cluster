@@ -1,8 +1,9 @@
 import 'dart:async';
 import 'dart:math' as math;
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:soundpool/soundpool.dart';
+import 'package:audioplayers/audioplayers.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -19,7 +20,7 @@ class RevHeadzVazApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'RevHeadz VAZ Edition',
+      title: 'RevHeadz VAZ Turbo Edition',
       debugShowCheckedModeBanner: false,
       theme: ThemeData.dark().copyWith(
         scaffoldBackgroundColor: const Color(0xFF121315),
@@ -30,63 +31,121 @@ class RevHeadzVazApp extends StatelessWidget {
 }
 
 // ============================================================================
-// 1. ЗВУКОВОЙ ДВИЖОК И ФИЗИКА ОБОРОТОВ ДВИГАТЕЛЯ
+// 1. ВСТРОЕННЫЙ СИНТЕЗАТОР ЗВУКОВ
+// ============================================================================
+class BuiltinSoundGenerator {
+  static Uint8List createWavHeader(int dataLength, int sampleRate, int numChannels, int bitsPerSample) {
+    final byteRate = sampleRate * numChannels * bitsPerSample ~/ 8;
+    final blockAlign = numChannels * bitsPerSample ~/ 8;
+    final buffer = ByteData(44);
+
+    buffer.setUint8(0, 0x52); buffer.setUint8(1, 0x49); buffer.setUint8(2, 0x46); buffer.setUint8(3, 0x46);
+    buffer.setUint32(4, 36 + dataLength, Endian.little);
+    buffer.setUint8(8, 0x57); buffer.setUint8(9, 0x41); buffer.setUint8(10, 0x56); buffer.setUint8(11, 0x45);
+    buffer.setUint8(12, 0x66); buffer.setUint8(13, 0x6D); buffer.setUint8(14, 0x74); buffer.setUint8(15, 0x20);
+    buffer.setUint32(16, 16, Endian.little);
+    buffer.setUint16(20, 1, Endian.little);
+    buffer.setUint16(22, numChannels, Endian.little);
+    buffer.setUint32(24, sampleRate, Endian.little);
+    buffer.setUint32(28, byteRate, Endian.little);
+    buffer.setUint16(32, blockAlign, Endian.little);
+    buffer.setUint16(34, bitsPerSample, Endian.little);
+    buffer.setUint8(36, 0x64); buffer.setUint8(37, 0x61); buffer.setUint8(38, 0x74); buffer.setUint8(39, 0x61);
+    buffer.setUint32(40, dataLength, Endian.little);
+
+    return buffer.buffer.asUint8List();
+  }
+
+  static Uint8List generateEngineLoopWav({required double baseFreq, required double durationSec, bool isLoad = false}) {
+    const sampleRate = 22050;
+    final numSamples = (sampleRate * durationSec).toInt();
+    final pcmData = Int16List(numSamples);
+    final rand = math.Random();
+
+    for (int i = 0; i < numSamples; i++) {
+      double t = i / sampleRate;
+      double s1 = math.sin(2 * math.pi * baseFreq * t);
+      double s2 = 0.5 * math.sin(4 * math.pi * baseFreq * t);
+      double s3 = 0.25 * math.sin(6 * math.pi * baseFreq * t);
+      double noise = (rand.nextDouble() * 2 - 1) * (isLoad ? 0.35 : 0.15);
+
+      double sample = (s1 + s2 + s3 + noise) / 2.0;
+      if (isLoad) {
+        sample = (sample * 1.6).clamp(-1.0, 1.0);
+      }
+      pcmData[i] = (sample * 28000).toInt();
+    }
+
+    final header = createWavHeader(numSamples * 2, sampleRate, 1, 16);
+    final fullWav = Uint8List(header.length + pcmData.lengthInBytes);
+    fullWav.setRange(0, header.length, header);
+    fullWav.setRange(header.length, fullWav.length, pcmData.buffer.asUint8List());
+    return fullWav;
+  }
+
+  static Uint8List generateBlowOffWav() {
+    const sampleRate = 22050;
+    const durationSec = 0.45;
+    final numSamples = (sampleRate * durationSec).toInt();
+    final pcmData = Int16List(numSamples);
+    final rand = math.Random();
+
+    for (int i = 0; i < numSamples; i++) {
+      double t = i / numSamples;
+      double envelope = math.exp(-6.0 * t);
+      double noise = (rand.nextDouble() * 2.0 - 1.0) * envelope;
+      double chirp = math.sin(2 * math.pi * (1800.0 - 1200.0 * t) * (i / sampleRate)) * envelope * 0.5;
+      pcmData[i] = ((noise + chirp) * 26000).clamp(-32000, 32000).toInt();
+    }
+
+    final header = createWavHeader(numSamples * 2, sampleRate, 1, 16);
+    final fullWav = Uint8List(header.length + pcmData.lengthInBytes);
+    fullWav.setRange(0, header.length, header);
+    fullWav.setRange(header.length, fullWav.length, pcmData.buffer.asUint8List());
+    return fullWav;
+  }
+}
+
+// ============================================================================
+// 2. ДВИЖОК ОБОРОТОВ, ТУРБОНАДДУВ И ЗВУК
 // ============================================================================
 class EngineController {
-  late Soundpool _pool;
+  final AudioPlayer _enginePlayer = AudioPlayer();
+  final AudioPlayer _fxPlayer = AudioPlayer();
   Timer? _ticker;
 
-  int _soundIdle = -1;
-  int _soundAccel = -1;
-  int _soundCoast = -1;
-  int _soundLimiter = -1;
-
-  int _streamIdle = 0;
-  int _streamAccel = 0;
-  int _streamCoast = 0;
+  Uint8List? _blowOffBytes;
 
   final double minRpm = 850.0;
   final double maxRpm = 7500.0;
   final double redlineRpm = 5600.0;
-  
+
   double currentRpm = 850.0;
   double throttle = 0.0;
+  double previousThrottle = 0.0;
   int currentGear = 1;
   bool isClutchPressed = false;
   double vehicleSpeed = 0.0;
 
-  final List<double> gearRatios = [3.636, 1.95, 1.357, 0.941, 0.784]; // КПП ВАЗ 2108-2109
+  double boostPressure = 0.0;
+  final double maxBoost = 1.5;
+
+  final List<double> gearRatios = [3.636, 1.95, 1.357, 0.941, 0.784];
   final double finalDrive = 3.9;
 
   Function()? onUpdate;
 
   Future<void> init() async {
-    _pool = Soundpool.fromOptions(
-      options: const SoundpoolOptions(
-        streamType: StreamType.music,
-        maxStreams: 8,
-      ),
-    );
-
     try {
-      _soundIdle = await _loadSound('assets/audio/idle.wav');
-      _soundAccel = await _loadSound('assets/audio/engine_accel.wav');
-      _soundCoast = await _loadSound('assets/audio/engine_coast.wav');
-      _soundLimiter = await _loadSound('assets/audio/limiter_pop.wav');
+      final engineLoop = BuiltinSoundGenerator.generateEngineLoopWav(baseFreq: 45.0, durationSec: 1.2, isLoad: true);
+      _blowOffBytes = BuiltinSoundGenerator.generateBlowOffWav();
 
-      _streamIdle = await _pool.play(_soundIdle, repeat: -1, rate: 1.0, volume: 1.0);
-      _streamAccel = await _pool.play(_soundAccel, repeat: -1, rate: 1.0, volume: 0.0);
-      _streamCoast = await _pool.play(_soundCoast, repeat: -1, rate: 1.0, volume: 0.0);
-    } catch (_) {
-      // Приложение работает и без звуковых файлов в режиме симуляции приборов
-    }
+      await _enginePlayer.setReleaseMode(ReleaseMode.loop);
+      await _enginePlayer.play(BytesSource(engineLoop));
+      await _enginePlayer.setVolume(0.8);
+    } catch (_) {}
 
     _startLoop();
-  }
-
-  Future<int> _loadSound(String path) async {
-    final rawData = await rootBundle.load(path);
-    return await _pool.load(rawData);
   }
 
   void _startLoop() {
@@ -106,6 +165,7 @@ class EngineController {
     if (currentGear < gearRatios.length) {
       currentGear++;
       _recalcRpmAfterShift();
+      _triggerBlowOffCheck();
     }
   }
 
@@ -123,17 +183,39 @@ class EngineController {
     }
   }
 
+  void _triggerBlowOffCheck() {
+    if (boostPressure > 0.35 && _blowOffBytes != null) {
+      _fxPlayer.play(BytesSource(_blowOffBytes!));
+      boostPressure = 0.0;
+    }
+  }
+
   void _updatePhysics(double dt) {
+    if (previousThrottle > 0.35 && throttle < 0.15) {
+      _triggerBlowOffCheck();
+    }
+    previousThrottle = throttle;
+
+    if (throttle > 0.1 && currentRpm > 2200) {
+      double targetBoost = (throttle * ((currentRpm - 2000) / (maxRpm - 2000)) * maxBoost).clamp(0.0, maxBoost);
+      boostPressure += (targetBoost - boostPressure) * (dt * 3.5);
+    } else {
+      boostPressure -= (boostPressure * 4.0) * dt;
+      if (boostPressure < 0) boostPressure = 0.0;
+    }
+
+    double boostMultiplier = 1.0 + (boostPressure * 0.85);
+
     if (isClutchPressed) {
       if (throttle > 0.05) {
-        currentRpm += (throttle * 9500.0) * dt;
+        currentRpm += (throttle * 9500.0 * boostMultiplier) * dt;
       } else {
         currentRpm -= 4500.0 * dt;
       }
       vehicleSpeed -= (vehicleSpeed * 0.15) * dt;
     } else {
       if (throttle > 0.05) {
-        double accel = (throttle * 7800.0) / (currentGear * 0.75);
+        double accel = ((throttle * 7800.0 * boostMultiplier) / (currentGear * 0.75));
         currentRpm += accel * dt;
       } else {
         currentRpm -= 3200.0 * dt;
@@ -145,9 +227,6 @@ class EngineController {
 
     if (currentRpm >= maxRpm) {
       currentRpm = maxRpm - 350.0;
-      if (_soundLimiter != -1) {
-        _pool.play(_soundLimiter, volume: 0.85);
-      }
     }
 
     currentRpm = currentRpm.clamp(minRpm, maxRpm);
@@ -155,32 +234,19 @@ class EngineController {
   }
 
   void _updateAudio() {
-    if (_soundIdle == -1) return;
-
-    double playbackRate = (currentRpm / 2800.0).clamp(0.5, 2.5);
-
-    double idleVol = (1.0 - (currentRpm - minRpm) / 1400.0).clamp(0.0, 1.0);
-    double loadVol = (throttle * (currentRpm / maxRpm)).clamp(0.0, 1.0);
-    double coastVol = ((1.0 - throttle) * (currentRpm - minRpm) / (maxRpm - minRpm)).clamp(0.0, 1.0);
-
-    _pool.setVolume(streamId: _streamIdle, volume: idleVol);
-    _pool.setRate(streamId: _streamIdle, rate: (currentRpm / minRpm).clamp(0.8, 1.3));
-
-    _pool.setVolume(streamId: _streamAccel, volume: loadVol);
-    _pool.setRate(streamId: _streamAccel, rate: playbackRate);
-
-    _pool.setVolume(streamId: _streamCoast, volume: coastVol);
-    _pool.setRate(streamId: _streamCoast, rate: playbackRate);
+    double playbackRate = (currentRpm / 2200.0).clamp(0.5, 2.5);
+    _enginePlayer.setPlaybackRate(playbackRate);
   }
 
   void dispose() {
     _ticker?.cancel();
-    _pool.release();
+    _enginePlayer.dispose();
+    _fxPlayer.dispose();
   }
 }
 
 // ============================================================================
-// 2. ИНТЕРФЕЙС ЭКРАНА: КНОПКИ REVHEADZ + ПРИБОРКА ВАЗ
+// 3. ИНТЕРФЕЙС ПРИБОРНОЙ ПАНЕЛИ ВАЗ
 // ============================================================================
 class RevHeadzDashboardScreen extends StatefulWidget {
   const RevHeadzDashboardScreen({super.key});
@@ -224,19 +290,14 @@ class _RevHeadzDashboardScreenState extends State<RevHeadzDashboardScreen> {
             padding: const EdgeInsets.symmetric(horizontal: 10.0, vertical: 6.0),
             child: Row(
               children: [
-                // Левая панель: Кнопки RevHeadz
                 Expanded(
                   flex: 3,
                   child: _buildLeftControlPanel(),
                 ),
-
-                // Центр: Приборная панель ВАЗ
                 Expanded(
                   flex: 7,
                   child: _buildVazInstrumentCluster(),
                 ),
-
-                // Правая панель: Ползунок акселератора
                 Expanded(
                   flex: 2,
                   child: _buildRightThrottlePanel(),
@@ -266,8 +327,8 @@ class _RevHeadzDashboardScreenState extends State<RevHeadzDashboardScreen> {
                 });
               },
               child: Container(
-                width: 58,
-                height: 58,
+                width: 56,
+                height: 56,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
                   gradient: RadialGradient(
@@ -284,11 +345,7 @@ class _RevHeadzDashboardScreenState extends State<RevHeadzDashboardScreen> {
                   child: Text(
                     isEngineRunning ? 'STOP' : 'START\nENGINE',
                     textAlign: TextAlign.center,
-                    style: const TextStyle(
-                      fontSize: 10,
-                      fontWeight: FontWeight.w900,
-                      color: Colors.white,
-                    ),
+                    style: const TextStyle(fontSize: 10, fontWeight: FontWeight.w900, color: Colors.white),
                   ),
                 ),
               ),
@@ -357,7 +414,7 @@ class _RevHeadzDashboardScreenState extends State<RevHeadzDashboardScreen> {
           },
           child: Container(
             width: double.infinity,
-            height: 48,
+            height: 46,
             decoration: BoxDecoration(
               gradient: LinearGradient(
                 colors: _engine.isClutchPressed
@@ -370,12 +427,7 @@ class _RevHeadzDashboardScreenState extends State<RevHeadzDashboardScreen> {
             child: const Center(
               child: Text(
                 'CLUTCH (СЦЕПЛЕНИЕ)',
-                style: TextStyle(
-                  color: Colors.white,
-                  fontWeight: FontWeight.bold,
-                  fontSize: 12,
-                  letterSpacing: 1.2,
-                ),
+                style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11, letterSpacing: 1.2),
               ),
             ),
           ),
@@ -392,19 +444,13 @@ class _RevHeadzDashboardScreenState extends State<RevHeadzDashboardScreen> {
         color: const Color(0xFF2B2E38),
         borderRadius: BorderRadius.circular(8),
         border: Border.all(color: Colors.white24),
-        boxShadow: const [
-          BoxShadow(color: Colors.black87, blurRadius: 4, offset: Offset(0, 2))
-        ],
+        boxShadow: const [BoxShadow(color: Colors.black87, blurRadius: 4, offset: Offset(0, 2))],
       ),
       child: IconButton(
         onPressed: onPressed,
         icon: Text(
           label,
-          style: TextStyle(
-            fontSize: 24,
-            fontWeight: FontWeight.w900,
-            color: onPressed == null ? Colors.white24 : Colors.white,
-          ),
+          style: TextStyle(fontSize: 24, fontWeight: FontWeight.w900, color: onPressed == null ? Colors.white24 : Colors.white),
         ),
       ),
     );
@@ -412,20 +458,18 @@ class _RevHeadzDashboardScreenState extends State<RevHeadzDashboardScreen> {
 
   Widget _buildVazInstrumentCluster() {
     return Container(
-      margin: const EdgeInsets.symmetric(horizontal: 8.0),
-      padding: const EdgeInsets.all(8.0),
+      margin: const EdgeInsets.symmetric(horizontal: 6.0),
+      padding: const EdgeInsets.all(6.0),
       decoration: BoxDecoration(
         color: const Color(0xFF08090A),
         borderRadius: BorderRadius.circular(16),
         border: Border.all(color: const Color(0xFF2A2D33), width: 3),
-        boxShadow: const [
-          BoxShadow(color: Colors.black, blurRadius: 10, spreadRadius: 2)
-        ],
+        boxShadow: const [BoxShadow(color: Colors.black, blurRadius: 10, spreadRadius: 2)],
       ),
       child: Row(
         children: [
-          // Спидометр ВАЗ
           Expanded(
+            flex: 4,
             child: AspectRatio(
               aspectRatio: 1,
               child: CustomPaint(
@@ -440,22 +484,35 @@ class _RevHeadzDashboardScreenState extends State<RevHeadzDashboardScreen> {
               ),
             ),
           ),
-          // Лампы приборки
-          Container(
-            width: 70,
-            margin: const EdgeInsets.symmetric(horizontal: 4),
+          Expanded(
+            flex: 3,
             child: Column(
               mainAxisAlignment: MainAxisAlignment.spaceEvenly,
               children: [
-                _buildWarningIcon(Icons.oil_barrel, _engine.currentRpm < 900 && isEngineRunning, Colors.red),
-                _buildWarningIcon(Icons.battery_alert, (!isEngineRunning || _engine.currentRpm < 600), Colors.red),
-                _buildWarningIcon(Icons.warning_amber_rounded, _engine.currentRpm > 5600, Colors.amber),
-                _buildWarningIcon(Icons.airline_seat_recline_normal, false, Colors.red),
+                SizedBox(
+                  width: 84,
+                  height: 84,
+                  child: CustomPaint(
+                    painter: BoostGaugePainter(
+                      boost: isEngineRunning ? _engine.boostPressure : 0.0,
+                    ),
+                  ),
+                ),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    _buildWarningIcon(Icons.oil_barrel, _engine.currentRpm < 900 && isEngineRunning, Colors.red),
+                    const SizedBox(width: 8),
+                    _buildWarningIcon(Icons.battery_alert, (!isEngineRunning || _engine.currentRpm < 600), Colors.red),
+                    const SizedBox(width: 8),
+                    _buildWarningIcon(Icons.warning_amber_rounded, _engine.currentRpm > 5600, Colors.amber),
+                  ],
+                ),
               ],
             ),
           ),
-          // Тахометр ВАЗ
           Expanded(
+            flex: 4,
             child: AspectRatio(
               aspectRatio: 1,
               child: CustomPaint(
@@ -476,31 +533,18 @@ class _RevHeadzDashboardScreenState extends State<RevHeadzDashboardScreen> {
   }
 
   Widget _buildWarningIcon(IconData icon, bool active, Color activeColor) {
-    return Icon(
-      icon,
-      size: 20,
-      color: active ? activeColor : const Color(0xFF1E2126),
-    );
+    return Icon(icon, size: 18, color: active ? activeColor : const Color(0xFF1E2126));
   }
 
   Widget _buildRightThrottlePanel() {
     return Column(
       children: [
-        const Text(
-          'THROTTLE',
-          style: TextStyle(
-            color: Colors.white54,
-            fontSize: 10,
-            fontWeight: FontWeight.bold,
-            letterSpacing: 1.5,
-          ),
-        ),
+        const Text('THROTTLE', style: TextStyle(color: Colors.white54, fontSize: 10, fontWeight: FontWeight.bold, letterSpacing: 1.5)),
         const SizedBox(height: 6),
         Expanded(
           child: GestureDetector(
             onVerticalDragUpdate: (details) {
               if (!isEngineRunning) return;
-              final box = context.findRenderObject() as RenderBox;
               final localPos = details.localPosition.dy;
               double val = 1.0 - (localPos / 180.0);
               _engine.setThrottle(val.clamp(0.0, 1.0));
@@ -512,9 +556,6 @@ class _RevHeadzDashboardScreenState extends State<RevHeadzDashboardScreen> {
                 color: const Color(0xFF181A20),
                 borderRadius: BorderRadius.circular(28),
                 border: Border.all(color: const Color(0xFF333842), width: 2),
-                boxShadow: const [
-                  BoxShadow(color: Colors.black87, blurRadius: 4, offset: Offset(1, 1))
-                ],
               ),
               child: Stack(
                 alignment: Alignment.bottomCenter,
@@ -536,11 +577,7 @@ class _RevHeadzDashboardScreenState extends State<RevHeadzDashboardScreen> {
                     mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                     children: List.generate(
                       10,
-                      (index) => Container(
-                        width: 24,
-                        height: 2,
-                        color: Colors.white12,
-                      ),
+                      (index) => Container(width: 24, height: 2, color: Colors.white12),
                     ),
                   ),
                 ],
@@ -553,9 +590,46 @@ class _RevHeadzDashboardScreenState extends State<RevHeadzDashboardScreen> {
   }
 }
 
-// ============================================================================
-// 3. ОТРИСОВКА ШКАЛ ПРИБОРОВ ВАЗ (СКОРОСТЬ И ОБОРОТЫ)
-// ============================================================================
+class BoostGaugePainter extends CustomPainter {
+  final double boost;
+  BoostGaugePainter({required this.boost});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = Offset(size.width / 2, size.height / 2);
+    final radius = size.width / 2 - 2;
+    const startAngle = 0.75 * math.pi;
+    const sweepAngle = 1.5 * math.pi;
+
+    canvas.drawCircle(center, radius, Paint()..color = const Color(0xFF0F1014));
+    canvas.drawCircle(center, radius, Paint()..color = const Color(0xFF3B4048)..style = PaintingStyle.stroke..strokeWidth = 2.5);
+
+    final tickPaint = Paint()..color = Colors.cyanAccent.withOpacity(0.8)..strokeWidth = 1.5;
+    for (int i = 0; i <= 6; i++) {
+      double angle = startAngle + (i / 6.0) * sweepAngle;
+      Offset p1 = Offset(center.dx + (radius - 4) * math.cos(angle), center.dy + (radius - 4) * math.sin(angle));
+      Offset p2 = Offset(center.dx + (radius - 10) * math.cos(angle), center.dy + (radius - 10) * math.sin(angle));
+      canvas.drawLine(p1, p2, tickPaint);
+    }
+
+    final tp = TextPainter(
+      text: TextSpan(text: '${boost.toStringAsFixed(1)}\nBAR', style: const TextStyle(color: Colors.cyanAccent, fontSize: 9, fontWeight: FontWeight.bold, height: 1.0)),
+      textAlign: TextAlign.center,
+      textDirection: TextDirection.ltr,
+    )..layout();
+    tp.paint(canvas, Offset(center.dx - tp.width / 2, center.dy + 8));
+
+    double clampedBoost = boost.clamp(0.0, 1.5);
+    double needleAngle = startAngle + (clampedBoost / 1.5) * sweepAngle;
+    Offset needleTip = Offset(center.dx + (radius - 8) * math.cos(needleAngle), center.dy + (radius - 8) * math.sin(needleAngle));
+    canvas.drawLine(center, needleTip, Paint()..color = Colors.cyanAccent..strokeWidth = 2.0..strokeCap = StrokeCap.round);
+    canvas.drawCircle(center, 3, Paint()..color = Colors.white);
+  }
+
+  @override
+  bool shouldRepaint(covariant BoostGaugePainter oldDelegate) => true;
+}
+
 class VazGaugePainter extends CustomPainter {
   final double value;
   final double maxValue;
@@ -577,116 +651,45 @@ class VazGaugePainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     final center = Offset(size.width / 2, size.height / 2);
     final radius = size.width / 2 - 4;
-
     const startAngle = 0.75 * math.pi;
     const sweepAngle = 1.5 * math.pi;
 
-    final dialBg = Paint()..color = const Color(0xFF0E1012);
-    canvas.drawCircle(center, radius, dialBg);
+    canvas.drawCircle(center, radius, Paint()..color = const Color(0xFF0E1012));
+    canvas.drawCircle(center, radius, Paint()..color = const Color(0xFF282A2E)..style = PaintingStyle.stroke..strokeWidth = 3);
 
-    final rimPaint = Paint()
-      ..color = const Color(0xFF282A2E)
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 3;
-    canvas.drawCircle(center, radius, rimPaint);
-
-    final tickPaint = Paint()
-      ..color = const Color(0xFFD4E6B5)
-      ..strokeWidth = 1.8;
-
-    final redlinePaint = Paint()
-      ..color = const Color(0xFFFF3B30)
-      ..strokeWidth = 3.5;
-
-    final textPainter = TextPainter(
-      textDirection: TextDirection.ltr,
-      textAlign: TextAlign.center,
-    );
+    final tickPaint = Paint()..color = const Color(0xFFD4E6B5)..strokeWidth = 1.8;
+    final redlinePaint = Paint()..color = const Color(0xFFFF3B30)..strokeWidth = 3.5;
+    final textPainter = TextPainter(textDirection: TextDirection.ltr, textAlign: TextAlign.center);
 
     int totalSteps = (maxValue / step).round();
     for (int i = 0; i <= totalSteps; i++) {
       double currentVal = i * step;
       double angle = startAngle + (currentVal / maxValue) * sweepAngle;
-
       bool isRed = currentVal >= redlineStart;
-      Paint currentTickPaint = isRed ? redlinePaint : tickPaint;
 
-      double tickLength = 10.0;
-      Offset p1 = Offset(
-        center.dx + (radius - 6) * math.cos(angle),
-        center.dy + (radius - 6) * math.sin(angle),
-      );
-      Offset p2 = Offset(
-        center.dx + (radius - 6 - tickLength) * math.cos(angle),
-        center.dy + (radius - 6 - tickLength) * math.sin(angle),
-      );
-      canvas.drawLine(p1, p2, currentTickPaint);
-
-      if (i < totalSteps) {
-        double midAngle = angle + (step / (2 * maxValue)) * sweepAngle;
-        Offset mp1 = Offset(
-          center.dx + (radius - 6) * math.cos(midAngle),
-          center.dy + (radius - 6) * math.sin(midAngle),
-        );
-        Offset mp2 = Offset(
-          center.dx + (radius - 6 - 5) * math.cos(midAngle),
-          center.dy + (radius - 6 - 5) * math.sin(midAngle),
-        );
-        canvas.drawLine(mp1, mp2, tickPaint);
-      }
+      Offset p1 = Offset(center.dx + (radius - 6) * math.cos(angle), center.dy + (radius - 6) * math.sin(angle));
+      Offset p2 = Offset(center.dx + (radius - 16) * math.cos(angle), center.dy + (radius - 16) * math.sin(angle));
+      canvas.drawLine(p1, p2, isRed ? redlinePaint : tickPaint);
 
       textPainter.text = TextSpan(
         text: currentVal.toInt().toString(),
-        style: TextStyle(
-          color: isRed ? const Color(0xFFFF3B30) : const Color(0xFFD4E6B5),
-          fontSize: 10,
-          fontWeight: FontWeight.bold,
-          fontFamily: 'sans-serif',
-        ),
+        style: TextStyle(color: isRed ? const Color(0xFFFF3B30) : const Color(0xFFD4E6B5), fontSize: 10, fontWeight: FontWeight.bold),
       );
       textPainter.layout();
-
-      double textRadius = radius - 24;
-      Offset textPos = Offset(
-        center.dx + textRadius * math.cos(angle) - textPainter.width / 2,
-        center.dy + textRadius * math.sin(angle) - textPainter.height / 2,
-      );
+      Offset textPos = Offset(center.dx + (radius - 24) * math.cos(angle) - textPainter.width / 2, center.dy + (radius - 24) * math.sin(angle) - textPainter.height / 2);
       textPainter.paint(canvas, textPos);
     }
 
-    textPainter.text = TextSpan(
-      text: title,
-      style: const TextStyle(
-        color: Color(0xFF88A070),
-        fontSize: 10,
-        fontWeight: FontWeight.bold,
-      ),
-    );
+    textPainter.text = TextSpan(text: title, style: const TextStyle(color: Color(0xFF88A070), fontSize: 10, fontWeight: FontWeight.bold));
     textPainter.layout();
-    textPainter.paint(
-      canvas,
-      Offset(center.dx - textPainter.width / 2, center.dy + radius * 0.42),
-    );
+    textPainter.paint(canvas, Offset(center.dx - textPainter.width / 2, center.dy + radius * 0.42));
 
     double clampedVal = value.clamp(0.0, maxValue);
     double needleAngle = startAngle + (clampedVal / maxValue) * sweepAngle;
+    Offset needleTip = Offset(center.dx + (radius - 14) * math.cos(needleAngle), center.dy + (radius - 14) * math.sin(needleAngle));
+    Offset needleBack = Offset(center.dx - 10 * math.cos(needleAngle), center.dy - 10 * math.sin(needleAngle));
 
-    final needlePaint = Paint()
-      ..color = const Color(0xFFFF5500)
-      ..strokeWidth = 3.0
-      ..strokeCap = StrokeCap.round;
-
-    Offset needleTip = Offset(
-      center.dx + (radius - 14) * math.cos(needleAngle),
-      center.dy + (radius - 14) * math.sin(needleAngle),
-    );
-    Offset needleBack = Offset(
-      center.dx - 10 * math.cos(needleAngle),
-      center.dy - 10 * math.sin(needleAngle),
-    );
-
-    canvas.drawLine(needleBack, needleTip, needlePaint);
-
+    canvas.drawLine(needleBack, needleTip, Paint()..color = const Color(0xFFFF5500)..strokeWidth = 3.0..strokeCap = StrokeCap.round);
     canvas.drawCircle(center, 6, Paint()..color = const Color(0xFF111111));
     canvas.drawCircle(center, 3, Paint()..color = const Color(0xFFFF5500));
   }
